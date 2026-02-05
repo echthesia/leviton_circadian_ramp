@@ -1,0 +1,9 @@
+[Unit]
+Description=Run circadian ramp at 07:20 daily
+
+[Timer]
+OnCalendar=*-*-* 07:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

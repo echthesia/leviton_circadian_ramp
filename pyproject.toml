@@ -1,9 +1,10 @@
 [project]
 name = "leviton-circadian-ramp"
 version = "0.1.0"
-description = "Add your description here"
+description = "Gradual brightness ramp for Leviton Decora WiFi switches following circadian rhythm"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "decora-wifi>=1.5",
+    "python-dotenv>=1.0",
 ]

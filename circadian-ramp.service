@@ -1,0 +1,9 @@
+[Unit]
+Description=Leviton Circadian Brightness Ramp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/circadian-ramp/venv/bin/python /opt/circadian-ramp/main.py
+EnvironmentFile=/etc/circadian-ramp.env
