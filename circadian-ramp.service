@@ -4,6 +4,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
-ExecStart=/opt/circadian-ramp/venv/bin/python /opt/circadian-ramp/main.py
+Type=simple
+ExecStart=/opt/circadian-ramp/venv/bin/python /opt/circadian-ramp/main.py service
 EnvironmentFile=/etc/circadian-ramp.env
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
