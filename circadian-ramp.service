@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/opt/circadian-ramp/venv/bin/python /opt/circadian-ramp/main.py service
+ExecReload=/bin/kill -USR1 $MAINPID
 EnvironmentFile=/etc/circadian-ramp.env
 Restart=on-failure
 RestartSec=30

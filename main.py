@@ -7,12 +7,12 @@ for overrides (skip, reschedule) and manual control.
 """
 
 import argparse
-import atexit
 import datetime
 import json
 import math
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -30,7 +30,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RAMP_TIME = os.environ.get("RAMP_TIME", "07:20")
 OVERRIDE_FILE = Path(os.environ.get("OVERRIDE_FILE", SCRIPT_DIR / "overrides.json"))
 STATE_FILE = SCRIPT_DIR / "state.json"
-PID_FILE = SCRIPT_DIR / "service.pid"
+SERVICE_NAME = "circadian-ramp.service"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -160,32 +160,19 @@ def interruptible_sleep(seconds: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# PID file management
+# Service notification via systemctl reload
 # ---------------------------------------------------------------------------
 
 
-def write_pid_file() -> None:
-    """Write the current PID to the PID file."""
-    PID_FILE.write_text(str(os.getpid()))
-    atexit.register(remove_pid_file)
-
-
-def remove_pid_file() -> None:
-    """Remove the PID file if it exists."""
-    try:
-        PID_FILE.unlink()
-    except FileNotFoundError:
-        pass
-
-
 def notify_service() -> None:
-    """Send SIGUSR1 to the running service (if any) so it re-evaluates."""
+    """Ask systemd to reload the service, which sends SIGUSR1 via ExecReload."""
     try:
-        pid = int(PID_FILE.read_text().strip())
-        os.kill(pid, signal.SIGUSR1)
-        log(f"Notified running service (PID {pid})")
-    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
-        pass  # Service not running — override will be picked up on next start
+        subprocess.run(
+            ["systemctl", "reload", SERVICE_NAME],
+            capture_output=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass  # systemctl not available or timed out — override saved for next wake
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +360,6 @@ def _authenticate_and_get_switches(test: bool) -> tuple:
 def cmd_service(args) -> None:
     """Run as a persistent service (systemd calls this)."""
     signal.signal(signal.SIGUSR1, _sigusr1_handler)
-    write_pid_file()
 
     test_mode = args.test
     if test_mode:
@@ -548,11 +534,16 @@ def cmd_status(args) -> None:
     # Service status
     print()
     try:
-        pid = int(PID_FILE.read_text().strip())
-        os.kill(pid, 0)  # Check if process exists
-        print(f"Service: running (PID {pid})")
-    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
-        print("Service: not running")
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", SERVICE_NAME],
+            capture_output=True, timeout=5,
+        )
+        if result.returncode == 0:
+            print("Service: running")
+        else:
+            print("Service: not running")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        print("Service: unknown (systemctl not available)")
 
 
 def cmd_clear(args) -> None:

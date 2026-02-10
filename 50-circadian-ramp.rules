@@ -1,0 +1,10 @@
+// Allow members of the "circadian" group to reload the circadian-ramp service.
+// Install to /etc/polkit-1/rules.d/50-circadian-ramp.rules
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "circadian-ramp.service" &&
+        action.lookup("verb") == "reload" &&
+        subject.isInGroup("circadian")) {
+        return polkit.Result.YES;
+    }
+});
