@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Circadian brightness ramp for Matter-enabled dimmers.
 
-Gradually increases brightness on a logarithmic scale to simulate natural sunrise.
-Runs as a persistent service that manages its own scheduling, with CLI subcommands
-for overrides (skip, reschedule) and manual control.
+Gradually increases brightness on a logarithmic scale to simulate natural sunrise,
+and optionally dims lights in the evening to simulate sunset.  Runs as a persistent
+service that manages its own scheduling, with CLI subcommands for overrides
+(skip, reschedule) and manual control.
 
 Communicates with dimmers via a local python-matter-server instance over WebSocket.
 """
@@ -34,6 +35,9 @@ STATE_FILE = SCRIPT_DIR / "state.json"
 SERVICE_NAME = "circadian-ramp.service"
 DEFAULT_MATTER_URL = "ws://localhost:5580/ws"
 DEFAULT_RAMP_TIME_FALLBACK = "07:20"
+DEFAULT_DIM_TIME = None  # disabled by default
+DEFAULT_RAMP_DURATION = 30  # minutes
+DEFAULT_DIM_DURATION = 135  # minutes
 MATTER_CONNECT_TIMEOUT = 30  # seconds
 
 # These are initialized after load_dotenv() by _init_env_config().
@@ -43,8 +47,13 @@ OVERRIDE_FILE = SCRIPT_DIR / "overrides.json"
 
 def _init_env_config() -> None:
     """Read env-dependent constants. Call after load_dotenv()."""
-    global DEFAULT_RAMP_TIME, OVERRIDE_FILE
+    global DEFAULT_RAMP_TIME, DEFAULT_DIM_TIME, DEFAULT_RAMP_DURATION, DEFAULT_DIM_DURATION
+    global OVERRIDE_FILE
     DEFAULT_RAMP_TIME = os.environ.get("RAMP_TIME", DEFAULT_RAMP_TIME_FALLBACK)
+    dim_time_env = os.environ.get("DIM_TIME", "")
+    DEFAULT_DIM_TIME = dim_time_env if dim_time_env else None
+    DEFAULT_RAMP_DURATION = int(os.environ.get("RAMP_DURATION", "30"))
+    DEFAULT_DIM_DURATION = int(os.environ.get("DIM_DURATION", "135"))
     OVERRIDE_FILE = Path(os.environ.get("OVERRIDE_FILE", SCRIPT_DIR / "overrides.json"))
 
 # ---------------------------------------------------------------------------
@@ -81,6 +90,45 @@ def cleanup_overrides(overrides: dict) -> dict:
     today = datetime.date.today().isoformat()
     cleaned = {date: val for date, val in overrides.items() if date >= today}
     return cleaned
+
+
+def _is_old_flat_format(entry: dict) -> bool:
+    """Check if an override entry uses the old flat format (has 'action' at top level)."""
+    return "action" in entry
+
+
+def _migrate_entry(entry: dict) -> dict:
+    """Migrate old flat-format entry to nested format under 'ramp' key."""
+    if _is_old_flat_format(entry):
+        return {"ramp": entry}
+    return entry
+
+
+def get_event_override(overrides: dict, date_str: str, event: str) -> dict:
+    """Read override for a specific event on a date.
+
+    Handles both old flat format (for 'ramp') and new nested format.
+    Returns the event-specific override dict, or {} if none.
+    """
+    entry = overrides.get(date_str, {})
+    if not entry:
+        return {}
+    if _is_old_flat_format(entry):
+        # Old flat format — only applies to ramp
+        return entry if event == "ramp" else {}
+    return entry.get(event, {})
+
+
+def set_event_override(overrides: dict, date_str: str, event: str, value: dict) -> None:
+    """Write override for a specific event on a date, using nested format.
+
+    Migrates any old flat-format entries for the same date.
+    """
+    entry = overrides.get(date_str, {})
+    if _is_old_flat_format(entry):
+        entry = _migrate_entry(entry)
+    entry[event] = value
+    overrides[date_str] = entry
 
 
 def parse_date_arg(value: str) -> str:
@@ -148,6 +196,19 @@ def record_run() -> None:
     """Record that the ramp ran today."""
     state = load_state()
     state["last_run"] = datetime.date.today().isoformat()
+    save_state(state)
+
+
+def already_dimmed_today() -> bool:
+    """Check if the dim already ran today."""
+    state = load_state()
+    return state.get("last_dim") == datetime.date.today().isoformat()
+
+
+def record_dim() -> None:
+    """Record that the dim ran today."""
+    state = load_state()
+    state["last_dim"] = datetime.date.today().isoformat()
     save_state(state)
 
 
@@ -390,6 +451,163 @@ async def run_ramp(
 
 
 # ---------------------------------------------------------------------------
+# Dim logic
+# ---------------------------------------------------------------------------
+
+
+def calculate_dim_times(total_seconds: float, start_pct: int = 100) -> list[tuple[float, int]]:
+    """Calculate the exact time each brightness level should be reached during dimming.
+
+    Returns a list of (time_offset, brightness_pct) in descending brightness order.
+    Uses a reverse logarithmic curve: fast initial drop, slow descent through dim levels.
+    """
+    times = []
+    min_brightness = 1
+    max_brightness = start_pct
+
+    if max_brightness <= min_brightness:
+        return [(0, min_brightness)]
+
+    log_ratio = math.log(max_brightness / min_brightness)
+
+    for brightness in range(max_brightness, min_brightness - 1, -1):
+        # Inverse of the ramp formula: t = T * (1 - log(b/min) / log(max/min))
+        if brightness <= min_brightness:
+            t = total_seconds
+        else:
+            t = total_seconds * (1 - math.log(brightness / min_brightness) / log_ratio)
+        times.append((t, brightness))
+
+    return times
+
+
+async def _read_current_brightness(client: MatterClient, node_id: int) -> int | None:
+    """Read current brightness percentage from a node, or None on failure."""
+    try:
+        nodes = client.get_nodes()
+        for node in nodes:
+            if node.node_id == node_id:
+                level = node.get_attribute_value(
+                    clusters.LevelControl.Attributes.CurrentLevel
+                )
+                if level is not None:
+                    return matter_level_to_pct(level)
+                return None
+    except Exception:
+        pass
+    return None
+
+
+async def run_dim(
+    client: MatterClient,
+    node_ids: list[int],
+    total_seconds: float,
+    matter_url: "str | None" = None,
+    ws_session_ref: "list | None" = None,
+    listen_task_ref: "list | None" = None,
+) -> MatterClient:
+    """Run the brightness dim on specified Matter nodes.
+
+    Reads current brightness, ramps down using a reverse log curve, and turns
+    off at the end.  Never brightens — if a light is already dimmer than the
+    target, the step is skipped.
+
+    Returns the (possibly new) client.
+    """
+    if not node_ids:
+        log("No nodes to control!")
+        return client
+
+    # Read current brightness from first node to determine starting point
+    current_pct = await _read_current_brightness(client, node_ids[0])
+    if current_pct is None:
+        current_pct = 100
+        log("Could not read current brightness, assuming 100%")
+    else:
+        log(f"Current brightness: {current_pct}%")
+
+    if current_pct < 2:
+        log("Lights already off or very dim, skipping dim")
+        return client
+
+    log(f"Starting brightness dim on node(s): {', '.join(str(n) for n in node_ids)}")
+    log(f"Duration: {total_seconds / 60:.1f} minutes, from {current_pct}% to off")
+
+    dim_schedule = calculate_dim_times(total_seconds, start_pct=current_pct)
+
+    start_time = time.time()
+    consecutive_failures = 0
+
+    for target_time, brightness in dim_schedule:
+        now = time.time()
+        elapsed = now - start_time
+        sleep_duration = target_time - elapsed
+
+        if sleep_duration > 0:
+            await asyncio.sleep(sleep_duration)
+
+        elapsed = time.time() - start_time
+        log(f"Setting brightness to {brightness}% ({elapsed / 60:.1f} min elapsed)")
+
+        # Per-node: never brighten during a dim
+        step_failed = False
+        for node_id in node_ids:
+            actual_pct = await _read_current_brightness(client, node_id)
+            if actual_pct is not None and actual_pct < brightness:
+                log(f"Node {node_id} already at {actual_pct}% (target {brightness}%), skipping")
+                continue
+            if actual_pct is None:
+                log(f"Could not read brightness for node {node_id}, skipping step (won't risk brightening)")
+                continue
+            try:
+                await _send_command(
+                    client, node_id,
+                    clusters.LevelControl.Commands.MoveToLevelWithOnOff(
+                        level=pct_to_matter_level(brightness),
+                        transitionTime=0, optionsMask=0, optionsOverride=0,
+                    ),
+                )
+            except Exception as e:
+                log(f"Error updating node {node_id}: {e}")
+                step_failed = True
+
+        if step_failed:
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                if matter_url and ws_session_ref is not None and listen_task_ref is not None:
+                    log("Too many failures, attempting reconnection...")
+                    try:
+                        await matter_disconnect(client, ws_session_ref[0], listen_task_ref[0])
+                    except Exception:
+                        pass
+                    try:
+                        client, new_ws, new_task = await matter_connect(matter_url)
+                        ws_session_ref[0] = new_ws
+                        listen_task_ref[0] = new_task
+                        consecutive_failures = 0
+                        log("Reconnected successfully, resuming dim")
+                        continue
+                    except Exception as re:
+                        log(f"Reconnection failed: {re}, aborting dim")
+                        raise
+                else:
+                    log(f"Aborting dim after {MAX_CONSECUTIVE_FAILURES} consecutive failures")
+                    raise ConnectionError("Too many consecutive command failures")
+        else:
+            consecutive_failures = 0
+
+    # Turn off at the end
+    log("Dim complete, turning off lights")
+    for node_id in node_ids:
+        try:
+            await _send_command(client, node_id, clusters.OnOff.Commands.Off())
+        except Exception as e:
+            log(f"Error turning off node {node_id}: {e}")
+
+    return client
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -467,6 +685,60 @@ async def _connect_and_validate(
     return client, ws_session, listen_task
 
 
+def _get_event_target_time(event: str, overrides: dict, today_str: str) -> str | None:
+    """Return the target time for an event today, or None if skipped/disabled."""
+    override = get_event_override(overrides, today_str, event)
+
+    if override.get("action") == "skip":
+        return None
+
+    if override.get("action") == "reschedule":
+        return override["time"]
+
+    if event == "ramp":
+        return DEFAULT_RAMP_TIME
+    elif event == "dim":
+        return DEFAULT_DIM_TIME
+    return None
+
+
+async def _run_event(
+    event: str, test_mode: bool, matter_url: str, node_ids: list[int],
+) -> None:
+    """Connect, execute one event (ramp or dim), and disconnect."""
+    if event == "ramp":
+        total_seconds = 2 * 60 if test_mode else DEFAULT_RAMP_DURATION * 60
+    else:
+        total_seconds = 2 * 60 if test_mode else DEFAULT_DIM_DURATION * 60
+
+    client = None
+    ws_session = None
+    listen_task = None
+    try:
+        client, ws_session, listen_task = await _connect_and_validate(matter_url, node_ids)
+        ws_ref = [ws_session]
+        task_ref = [listen_task]
+        if event == "ramp":
+            client = await run_ramp(
+                client, node_ids, total_seconds,
+                matter_url=matter_url,
+                ws_session_ref=ws_ref,
+                listen_task_ref=task_ref,
+            )
+        else:
+            client = await run_dim(
+                client, node_ids, total_seconds,
+                matter_url=matter_url,
+                ws_session_ref=ws_ref,
+                listen_task_ref=task_ref,
+            )
+        ws_session = ws_ref[0]
+        listen_task = task_ref[0]
+    finally:
+        if client and ws_session and listen_task:
+            await matter_disconnect(client, ws_session, listen_task)
+
+
 async def cmd_service(args) -> None:
     """Run as a persistent service (systemd calls this)."""
     loop = asyncio.get_running_loop()
@@ -477,7 +749,7 @@ async def cmd_service(args) -> None:
 
     test_mode = args.test
     if test_mode:
-        log("Service starting in TEST mode (2-minute ramps)")
+        log("Service starting in TEST mode (2-minute durations)")
     else:
         log("Service starting")
 
@@ -485,29 +757,46 @@ async def cmd_service(args) -> None:
         today_str = datetime.date.today().isoformat()
         overrides = load_overrides()
 
-        # Already ran today?
-        if already_ran_today():
-            log(f"Already ran today ({today_str}), sleeping until midnight")
+        # Build list of pending events for today
+        pending = []
+
+        # Ramp event
+        if not already_ran_today():
+            ramp_override = get_event_override(overrides, today_str, "ramp")
+            if ramp_override.get("action") == "skip":
+                log(f"Skip override active for ramp on {today_str}")
+                record_run()
+            else:
+                target = _get_event_target_time("ramp", overrides, today_str)
+                if target:
+                    pending.append(("ramp", target))
+
+        # Dim event
+        if DEFAULT_DIM_TIME is not None and not already_dimmed_today():
+            dim_override = get_event_override(overrides, today_str, "dim")
+            if dim_override.get("action") == "skip":
+                log(f"Skip override active for dim on {today_str}")
+                record_dim()
+            else:
+                target = _get_event_target_time("dim", overrides, today_str)
+                if target:
+                    pending.append(("dim", target))
+
+        if not pending:
+            log(f"All events done for {today_str}, sleeping until midnight")
+            # Clean up expired overrides
+            overrides = load_overrides()
+            cleaned = cleanup_overrides(overrides)
+            if cleaned != overrides:
+                save_overrides(cleaned)
             secs = _seconds_until_midnight()
             await interruptible_sleep(secs)
             continue
 
-        # Check for skip override
-        today_override = overrides.get(today_str, {})
-        if today_override.get("action") == "skip":
-            log(f"Skip override active for {today_str}")
-            record_run()  # Mark as handled so we don't re-check
-            secs = _seconds_until_midnight()
-            await interruptible_sleep(secs)
-            continue
-
-        # Determine target time
-        if today_override.get("action") == "reschedule":
-            target_time = today_override["time"]
-            log(f"Rescheduled ramp time for today: {target_time}")
-        else:
-            target_time = DEFAULT_RAMP_TIME
-            log(f"Default ramp time: {target_time}")
+        # Sort by target time, pick next
+        pending.sort(key=lambda x: x[1])
+        event, target_time = pending[0]
+        log(f"Next event: {event} at {target_time}")
 
         # Wait until target time
         wait_secs = _seconds_until(target_time)
@@ -516,67 +805,45 @@ async def cmd_service(args) -> None:
             interrupted = await interruptible_sleep(wait_secs)
             if interrupted:
                 log("Sleep interrupted, re-evaluating schedule")
-                continue  # Re-check overrides from the top
+                continue
 
         # Re-check overrides (may have changed while sleeping)
         overrides = load_overrides()
-        today_override = overrides.get(today_str, {})
-        if today_override.get("action") == "skip":
-            log(f"Skip override added while sleeping for {today_str}")
-            record_run()
-            secs = _seconds_until_midnight()
-            await interruptible_sleep(secs)
+        event_override = get_event_override(overrides, today_str, event)
+        if event_override.get("action") == "skip":
+            log(f"Skip override added while sleeping for {event} on {today_str}")
+            if event == "ramp":
+                record_run()
+            else:
+                record_dim()
             continue
 
-        if already_ran_today():
-            secs = _seconds_until_midnight()
-            await interruptible_sleep(secs)
+        # Check if already done (e.g. manual trigger while sleeping)
+        if event == "ramp" and already_ran_today():
+            continue
+        if event == "dim" and already_dimmed_today():
             continue
 
-        # Run the ramp
-        total_seconds = 2 * 60 if test_mode else 30 * 60
+        # Execute the event
         matter_url, node_ids = load_config()
-        client = None
-        ws_session = None
-        listen_task = None
         try:
-            client, ws_session, listen_task = await _connect_and_validate(matter_url, node_ids)
-            ws_ref = [ws_session]
-            task_ref = [listen_task]
-            client = await run_ramp(
-                client, node_ids, total_seconds,
-                matter_url=matter_url,
-                ws_session_ref=ws_ref,
-                listen_task_ref=task_ref,
-            )
-            ws_session = ws_ref[0]
-            listen_task = task_ref[0]
-            record_run()
+            await _run_event(event, test_mode, matter_url, node_ids)
+            if event == "ramp":
+                record_run()
+            else:
+                record_dim()
+            log(f"{event.capitalize()} complete")
         except Exception as e:
-            log(f"Ramp failed: {e}")
-            # Don't record_run on failure — will retry next loop iteration
-            # Sleep a bit before retrying to avoid tight error loops
+            log(f"{event.capitalize()} failed: {e}")
             await interruptible_sleep(60)
             continue
-        finally:
-            if client and ws_session and listen_task:
-                await matter_disconnect(client, ws_session, listen_task)
 
-        # Clean up expired overrides
-        overrides = load_overrides()
-        cleaned = cleanup_overrides(overrides)
-        if cleaned != overrides:
-            save_overrides(cleaned)
-
-        # Sleep until midnight
-        secs = _seconds_until_midnight()
-        log(f"Ramp complete, sleeping {secs / 60:.0f} minutes until midnight")
-        await interruptible_sleep(secs)
+        # Loop back to check for more events today
 
 
 async def cmd_run(args) -> None:
     """Run a single ramp immediately (manual trigger)."""
-    total_seconds = 2 * 60 if args.test else 30 * 60
+    total_seconds = 2 * 60 if args.test else DEFAULT_RAMP_DURATION * 60
     matter_url, node_ids = load_config()
     client = None
     ws_session = None
@@ -601,19 +868,48 @@ async def cmd_run(args) -> None:
             await matter_disconnect(client, ws_session, listen_task)
 
 
+async def cmd_dim(args) -> None:
+    """Run a single dim immediately (manual trigger)."""
+    total_seconds = 2 * 60 if args.test else DEFAULT_DIM_DURATION * 60
+    matter_url, node_ids = load_config()
+    client = None
+    ws_session = None
+    listen_task = None
+    try:
+        client, ws_session, listen_task = await _connect_and_validate(matter_url, node_ids)
+        ws_ref = [ws_session]
+        task_ref = [listen_task]
+        client = await run_dim(
+            client, node_ids, total_seconds,
+            matter_url=matter_url,
+            ws_session_ref=ws_ref,
+            listen_task_ref=task_ref,
+        )
+        ws_session = ws_ref[0]
+        listen_task = task_ref[0]
+    except Exception as e:
+        log(f"Error: {e}")
+        sys.exit(1)
+    finally:
+        if client and ws_session and listen_task:
+            await matter_disconnect(client, ws_session, listen_task)
+
+
 def cmd_skip(args) -> None:
     """Add a skip override for a date."""
     date_str = parse_date_arg(args.date)
+    event = getattr(args, "event", "ramp")
     overrides = load_overrides()
-    overrides[date_str] = {"action": "skip"}
+    set_event_override(overrides, date_str, event, {"action": "skip"})
     save_overrides(overrides)
-    log(f"Skipping ramp on {date_str}")
+    log(f"Skipping {event} on {date_str}")
     notify_service()
 
 
 def cmd_reschedule(args) -> None:
-    """Change ramp time for a date."""
+    """Change event time for a date."""
     date_str = parse_date_arg(args.date)
+    event = getattr(args, "event", "ramp")
     # Validate time format
     try:
         h, m = map(int, args.time.split(":"))
@@ -625,42 +921,60 @@ def cmd_reschedule(args) -> None:
         sys.exit(1)
 
     overrides = load_overrides()
-    overrides[date_str] = {"action": "reschedule", "time": time_str}
+    set_event_override(overrides, date_str, event, {"action": "reschedule", "time": time_str})
     save_overrides(overrides)
-    log(f"Rescheduled ramp on {date_str} to {time_str}")
+    log(f"Rescheduled {event} on {date_str} to {time_str}")
     notify_service()
 
 
+def _next_event_display(
+    event: str, default_time: str | None, done_today: bool,
+    overrides: dict, today: datetime.date,
+) -> str:
+    """Format a 'Next <event>: ...' line for status display."""
+    today_str = today.isoformat()
+    if default_time is None:
+        return f"Next {event}: disabled"
+
+    if done_today:
+        next_date = today + datetime.timedelta(days=1)
+    else:
+        override = get_event_override(overrides, today_str, event)
+        if override.get("action") == "skip":
+            next_date = today + datetime.timedelta(days=1)
+        else:
+            next_date = today
+
+    next_str = next_date.isoformat()
+    next_override = get_event_override(overrides, next_str, event)
+    if next_override.get("action") == "skip":
+        return f"Next {event}: {next_str} — SKIPPED"
+    elif next_override.get("action") == "reschedule":
+        return f"Next {event}: {next_str} at {next_override['time']}"
+    else:
+        return f"Next {event}: {next_str} at {default_time}"
+
+
 async def cmd_status(args) -> None:
-    """Show active overrides and next scheduled ramp."""
+    """Show active overrides and next scheduled events."""
     overrides = load_overrides()
     state = load_state()
 
     print("Circadian Ramp Status")
     print("=" * 40)
     print(f"Default ramp time: {DEFAULT_RAMP_TIME}")
-    print(f"Last run: {state.get('last_run', 'never')}")
+    print(f"Ramp duration: {DEFAULT_RAMP_DURATION} min")
+    print(f"Default dim time: {DEFAULT_DIM_TIME or 'disabled'}")
+    print(f"Dim duration: {DEFAULT_DIM_DURATION} min")
+    print(f"Last ramp: {state.get('last_run', 'never')}")
+    print(f"Last dim: {state.get('last_dim', 'never')}")
 
     today = datetime.date.today()
     today_str = today.isoformat()
 
-    # Determine next ramp
-    today_override = overrides.get(today_str, {})
-    if already_ran_today():
-        next_date = today + datetime.timedelta(days=1)
-    elif today_override.get("action") == "skip":
-        next_date = today + datetime.timedelta(days=1)
-    else:
-        next_date = today
-
-    next_str = next_date.isoformat()
-    next_override = overrides.get(next_str, {})
-    if next_override.get("action") == "skip":
-        print(f"Next ramp: {next_str} — SKIPPED")
-    elif next_override.get("action") == "reschedule":
-        print(f"Next ramp: {next_str} at {next_override['time']}")
-    else:
-        print(f"Next ramp: {next_str} at {DEFAULT_RAMP_TIME}")
+    print()
+    print(_next_event_display("ramp", DEFAULT_RAMP_TIME, already_ran_today(), overrides, today))
+    print(_next_event_display("dim", DEFAULT_DIM_TIME, already_dimmed_today(), overrides, today))
 
     # Show active overrides
     active = {d: v for d, v in overrides.items() if d >= today_str}
@@ -669,10 +983,20 @@ async def cmd_status(args) -> None:
         print("Active overrides:")
         for date in sorted(active):
             entry = active[date]
-            if entry.get("action") == "skip":
-                print(f"  {date}: skip")
-            elif entry.get("action") == "reschedule":
-                print(f"  {date}: reschedule to {entry['time']}")
+            if _is_old_flat_format(entry):
+                # Old flat format
+                if entry.get("action") == "skip":
+                    print(f"  {date}: ramp skip")
+                elif entry.get("action") == "reschedule":
+                    print(f"  {date}: ramp reschedule to {entry['time']}")
+            else:
+                # Nested format
+                for evt in sorted(entry):
+                    sub = entry[evt]
+                    if sub.get("action") == "skip":
+                        print(f"  {date}: {evt} skip")
+                    elif sub.get("action") == "reschedule":
+                        print(f"  {date}: {evt} reschedule to {sub['time']}")
     else:
         print()
         print("No active overrides")
@@ -706,15 +1030,30 @@ async def cmd_status(args) -> None:
 def cmd_clear(args) -> None:
     """Remove override(s)."""
     overrides = load_overrides()
+    event = getattr(args, "event", None)
 
     if args.date:
         date_str = parse_date_arg(args.date)
-        if date_str in overrides:
+        entry = overrides.get(date_str)
+        if entry is None:
+            log(f"No override found for {date_str}")
+        elif event:
+            # Clear specific event within a date
+            if _is_old_flat_format(entry):
+                entry = _migrate_entry(entry)
+                overrides[date_str] = entry
+            if event in entry:
+                del entry[event]
+                if not entry:
+                    del overrides[date_str]
+                save_overrides(overrides)
+                log(f"Cleared {event} override for {date_str}")
+            else:
+                log(f"No {event} override found for {date_str}")
+        else:
             del overrides[date_str]
             save_overrides(overrides)
-            log(f"Cleared override for {date_str}")
-        else:
-            log(f"No override found for {date_str}")
+            log(f"Cleared all overrides for {date_str}")
     else:
         save_overrides({})
         log("Cleared all overrides")
@@ -850,32 +1189,47 @@ def main() -> None:
     )
     subparsers = parser.add_subparsers(dest="command")
 
+    # Helper to add --event flag to override subcommands
+    def _add_event_arg(sp) -> None:
+        sp.add_argument(
+            "--event", choices=["ramp", "dim"], default="ramp",
+            help="Which event to target (default: ramp)",
+        )
+
     # service
     sp_service = subparsers.add_parser(
         "service", help="Run as persistent service (systemd calls this)"
     )
     sp_service.add_argument(
         "--test", action="store_true",
-        help="Use 2-minute test ramps instead of 30-minute ramps",
+        help="Use 2-minute test durations instead of configured durations",
     )
 
     # run
     sp_run = subparsers.add_parser("run", help="Run a single ramp immediately")
     sp_run.add_argument(
         "--test", action="store_true",
-        help="Use a 2-minute test ramp instead of 30 minutes",
+        help="Use a 2-minute test ramp instead of configured duration",
+    )
+
+    # dim
+    sp_dim = subparsers.add_parser("dim", help="Run a single dim immediately")
+    sp_dim.add_argument(
+        "--test", action="store_true",
+        help="Use a 2-minute test dim instead of configured duration",
     )
 
     # skip
-    sp_skip = subparsers.add_parser("skip", help="Skip ramp for a date")
+    sp_skip = subparsers.add_parser("skip", help="Skip an event for a date")
     sp_skip.add_argument(
         "date",
         help="Date to skip: 'today', 'tomorrow', day name, or YYYY-MM-DD",
     )
+    _add_event_arg(sp_skip)
 
     # reschedule
     sp_resched = subparsers.add_parser(
-        "reschedule", help="Change ramp time for a date"
+        "reschedule", help="Change event time for a date"
     )
     sp_resched.add_argument(
         "date",
@@ -883,8 +1237,9 @@ def main() -> None:
     )
     sp_resched.add_argument(
         "time",
-        help="New ramp time in HH:MM format",
+        help="New event time in HH:MM format",
     )
+    _add_event_arg(sp_resched)
 
     # status
     subparsers.add_parser("status", help="Show status, overrides, and Matter server info")
@@ -894,6 +1249,10 @@ def main() -> None:
     sp_clear.add_argument(
         "date", nargs="?", default=None,
         help="Date to clear (omit to clear all)",
+    )
+    sp_clear.add_argument(
+        "--event", choices=["ramp", "dim"], default=None,
+        help="Which event to clear (omit to clear all events for the date)",
     )
 
     # list
@@ -937,6 +1296,7 @@ def main() -> None:
     async_dispatch = {
         "service": cmd_service,
         "run": cmd_run,
+        "dim": cmd_dim,
         "status": cmd_status,
         "list": cmd_list,
         "commission": cmd_commission,

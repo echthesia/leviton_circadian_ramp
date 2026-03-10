@@ -1,6 +1,6 @@
 # Circadian Ramp
 
-Gradually increases brightness on Matter-enabled dimmers following a logarithmic curve to simulate natural sunrise. Runs as a persistent systemd service with CLI overrides for skipping or rescheduling.
+Gradually increases brightness on Matter-enabled dimmers following a logarithmic curve to simulate natural sunrise, and optionally dims lights in the evening to simulate sunset. Runs as a persistent systemd service with CLI overrides for skipping or rescheduling.
 
 ## Requirements
 
@@ -34,6 +34,9 @@ Edit `/etc/circadian-ramp.env`:
 MATTER_SERVER_URL=ws://localhost:5580/ws
 NODE_IDS=1,2
 RAMP_TIME=07:20
+RAMP_DURATION=30
+DIM_TIME=21:00
+DIM_DURATION=135
 ```
 
 | Variable | Description | Default |
@@ -41,6 +44,9 @@ RAMP_TIME=07:20
 | `MATTER_SERVER_URL` | WebSocket URL of the matter-server | `ws://localhost:5580/ws` |
 | `NODE_IDS` | Comma-separated Matter node IDs to control | *(required)* |
 | `RAMP_TIME` | Daily ramp start time (HH:MM, 24h) | `07:20` |
+| `RAMP_DURATION` | Ramp duration in minutes | `30` |
+| `DIM_TIME` | Daily dim start time (HH:MM, 24h); unset = disabled | *(disabled)* |
+| `DIM_DURATION` | Dim duration in minutes | `135` |
 
 ## Setting up systemd services
 
@@ -87,16 +93,19 @@ python main.py <command> [options]
 |---|---|
 | `service [--test]` | Run as persistent service (systemd calls this) |
 | `run [--test]` | Run a single ramp immediately |
+| `dim [--test]` | Run a single dim immediately |
 | `list` | List all commissioned Matter nodes |
 | `status` | Show schedule, overrides, and Matter server status |
-| `skip <date>` | Skip the ramp for a date |
-| `reschedule <date> <HH:MM>` | Change ramp time for a date |
-| `clear [date]` | Remove one or all overrides |
+| `skip <date> [--event ramp\|dim]` | Skip an event for a date |
+| `reschedule <date> <HH:MM> [--event ramp\|dim]` | Change event time for a date |
+| `clear [date] [--event ramp\|dim]` | Remove one or all overrides |
 | `commission <code>` | Commission a new Matter device |
 | `set-wifi <ssid> <password>` | Store WiFi credentials for commissioning |
 | `remove-node <node_id>` | Remove a commissioned node |
 
-The `--test` flag uses a 2-minute ramp instead of the default 30 minutes.
+The `--test` flag uses a 2-minute duration instead of the configured duration.
+
+The `--event` flag targets a specific event (`ramp` or `dim`, default: `ramp`).
 
 Date arguments accept: `today`, `tomorrow`, day names (`monday`–`sunday`), or `YYYY-MM-DD`.
 
@@ -106,11 +115,20 @@ Date arguments accept: `today`, `tomorrow`, day names (`monday`–`sunday`), or 
 # Quick test ramp
 python main.py run --test
 
+# Quick test dim
+python main.py dim --test
+
 # Skip tomorrow's ramp
 python main.py skip tomorrow
 
+# Skip tomorrow's dim
+python main.py skip tomorrow --event dim
+
 # Reschedule Monday's ramp to 6:00 AM
 python main.py reschedule monday 06:00
+
+# Reschedule tonight's dim to 10 PM
+python main.py reschedule today 22:00 --event dim
 
 # Check status
 python main.py status
@@ -126,9 +144,11 @@ The service runs two processes:
 1. **matter-server** — persistent daemon that manages the Matter fabric, device state, and commissioning. Listens on a local WebSocket port.
 2. **circadian-ramp** — connects to matter-server as a client. Handles scheduling, overrides, and drives the brightness ramp.
 
-The ramp follows a logarithmic curve from 1% to 100% brightness, so lower levels change slowly (mimicking dawn) and higher levels ramp faster.
+The morning ramp follows a logarithmic curve from 1% to 100% brightness, so lower levels change slowly (mimicking dawn) and higher levels ramp faster.
 
-Override commands (`skip`, `reschedule`, `clear`) send SIGUSR1 to the service via `systemctl reload`, causing it to immediately re-evaluate the schedule.
+The evening dim (when enabled via `DIM_TIME`) uses a reverse logarithmic curve: brightness drops quickly at first, then lingers at dim levels before turning off. During dimming, the system never brightens — if a light is already dimmer than the next target (e.g., manually dimmed), that step is skipped.
+
+Override commands (`skip`, `reschedule`, `clear`) send SIGUSR1 to the service via `systemctl reload`, causing it to immediately re-evaluate the schedule. Use `--event dim` to target the dim event specifically.
 
 ## Architecture
 
