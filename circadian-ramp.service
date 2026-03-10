@@ -1,7 +1,8 @@
 [Unit]
-Description=Leviton Circadian Brightness Ramp
-After=network-online.target
+Description=Circadian Brightness Ramp (Matter)
+After=network-online.target matter-server.service
 Wants=network-online.target
+Requires=matter-server.service
 
 [Service]
 Type=simple

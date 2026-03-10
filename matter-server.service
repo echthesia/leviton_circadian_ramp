@@ -1,0 +1,16 @@
+[Unit]
+Description=Python Matter Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/circadian-ramp/venv/bin/python -m matter_server.server \
+    --storage-path /opt/matter-server/data \
+    --port 5580 \
+    --listen-address 127.0.0.1
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

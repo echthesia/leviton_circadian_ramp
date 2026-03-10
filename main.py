@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Circadian brightness ramp for Leviton Decora WiFi switches.
+"""Circadian brightness ramp for Matter-enabled dimmers.
 
 Gradually increases brightness on a logarithmic scale to simulate natural sunrise.
 Runs as a persistent service that manages its own scheduling, with CLI subcommands
 for overrides (skip, reschedule) and manual control.
+
+Communicates with dimmers via a local python-matter-server instance over WebSocket.
 """
 
 import argparse
+import asyncio
 import datetime
 import json
 import math
@@ -14,23 +17,35 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
-from decora_wifi import DecoraWiFiSession
-from decora_wifi.models.residential_account import ResidentialAccount
+import aiohttp
 from dotenv import load_dotenv
+from matter_server.client import MatterClient
+from chip.clusters import Objects as clusters
 
 # ---------------------------------------------------------------------------
 # Constants & paths
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_RAMP_TIME = os.environ.get("RAMP_TIME", "07:20")
-OVERRIDE_FILE = Path(os.environ.get("OVERRIDE_FILE", SCRIPT_DIR / "overrides.json"))
 STATE_FILE = SCRIPT_DIR / "state.json"
 SERVICE_NAME = "circadian-ramp.service"
+DEFAULT_MATTER_URL = "ws://localhost:5580/ws"
+DEFAULT_RAMP_TIME_FALLBACK = "07:20"
+MATTER_CONNECT_TIMEOUT = 30  # seconds
+
+# These are initialized after load_dotenv() by _init_env_config().
+DEFAULT_RAMP_TIME = DEFAULT_RAMP_TIME_FALLBACK
+OVERRIDE_FILE = SCRIPT_DIR / "overrides.json"
+
+
+def _init_env_config() -> None:
+    """Read env-dependent constants. Call after load_dotenv()."""
+    global DEFAULT_RAMP_TIME, OVERRIDE_FILE
+    DEFAULT_RAMP_TIME = os.environ.get("RAMP_TIME", DEFAULT_RAMP_TIME_FALLBACK)
+    OVERRIDE_FILE = Path(os.environ.get("OVERRIDE_FILE", SCRIPT_DIR / "overrides.json"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -137,26 +152,23 @@ def record_run() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Interruptible sleep via SIGUSR1
+# Interruptible sleep via SIGUSR1 (async)
 # ---------------------------------------------------------------------------
 
-_wake_event = threading.Event()
+_wake_event = asyncio.Event()
 
 
-def _sigusr1_handler(signum, frame):
-    """Signal handler: wake the service loop immediately."""
-    log("Received SIGUSR1, waking up to re-evaluate schedule")
-    _wake_event.set()
-
-
-def interruptible_sleep(seconds: float) -> bool:
+async def interruptible_sleep(seconds: float) -> bool:
     """Sleep for up to *seconds*, returning early if SIGUSR1 is received.
 
     Returns True if interrupted, False if the full duration elapsed.
     """
     _wake_event.clear()
-    interrupted = _wake_event.wait(timeout=seconds)
-    return interrupted
+    try:
+        await asyncio.wait_for(_wake_event.wait(), timeout=seconds)
+        return True  # interrupted
+    except asyncio.TimeoutError:
+        return False  # full duration elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -176,58 +188,74 @@ def notify_service() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Leviton API helpers (unchanged from original)
+# Matter brightness helpers
 # ---------------------------------------------------------------------------
 
 
-def get_session_and_switches(email: str, password: str) -> tuple:
-    """Authenticate and retrieve all switches."""
-    log("Authenticating with Leviton cloud...")
-    session = DecoraWiFiSession()
-    session.login(email, password)
-
-    log("Fetching residences and switches...")
-    all_switches = []
-    perms = session.user.get_residential_permissions()
-
-    for perm in perms:
-        account_id = perm.data.get("residentialAccountId")
-        if not account_id:
-            continue
-
-        account = ResidentialAccount(session, account_id)
-        residences = account.get_residences()
-
-        for residence in residences:
-            switches = residence.get_iot_switches()
-            all_switches.extend(switches)
-
-    log(f"Found {len(all_switches)} total switches")
-    return session, all_switches
+def pct_to_matter_level(pct: int) -> int:
+    """Convert 0-100% brightness to Matter 0-254 level."""
+    return max(0, min(254, round(pct * 254 / 100)))
 
 
-def filter_switches(switches: list, switch_names: list[str]) -> list:
-    """Filter switches by name."""
-    if not switch_names:
-        return switches
-    return [s for s in switches if s.name in switch_names]
-
-
-def list_switches(switches: list) -> None:
-    """Print all switches and their current state."""
-    log("Listing all switches:")
-    print()
-    for switch in switches:
-        power = getattr(switch, "power", "unknown")
-        brightness = getattr(switch, "brightness", "N/A")
-        print(f"  Name: {switch.name}")
-        print(f"    Power: {power}")
-        print(f"    Brightness: {brightness}%")
-        print()
+def matter_level_to_pct(level: int) -> int:
+    """Convert Matter 0-254 level to 0-100%."""
+    return max(0, min(100, round(level * 100 / 254)))
 
 
 # ---------------------------------------------------------------------------
-# Ramp logic (unchanged from original)
+# Matter connection helpers
+# ---------------------------------------------------------------------------
+
+
+async def matter_connect(url: str) -> tuple[MatterClient, aiohttp.ClientSession, asyncio.Task]:
+    """Create, connect, and start listening on a MatterClient.
+
+    Returns (client, aiohttp_session, listen_task).
+    ``start_listening`` runs as a background task; the function waits for the
+    initial node data before returning.
+    """
+    ws_session = aiohttp.ClientSession()
+    client = MatterClient(url, ws_session)
+
+    init_ready = asyncio.Event()
+
+    async def _listen() -> None:
+        await client.start_listening(init_ready=init_ready)
+
+    listen_task = asyncio.create_task(_listen())
+
+    try:
+        await asyncio.wait_for(init_ready.wait(), timeout=MATTER_CONNECT_TIMEOUT)
+    except asyncio.TimeoutError:
+        listen_task.cancel()
+        await ws_session.close()
+        raise ConnectionError(
+            f"Timed out after {MATTER_CONNECT_TIMEOUT}s waiting for matter-server at {url}"
+        )
+
+    return client, ws_session, listen_task
+
+
+async def matter_disconnect(
+    client: MatterClient,
+    ws_session: aiohttp.ClientSession,
+    listen_task: asyncio.Task,
+) -> None:
+    """Cleanly disconnect from matter-server."""
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    listen_task.cancel()
+    try:
+        await listen_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    await ws_session.close()
+
+
+# ---------------------------------------------------------------------------
+# Ramp logic
 # ---------------------------------------------------------------------------
 
 
@@ -249,29 +277,62 @@ def calculate_brightness_times(total_seconds: float) -> list[tuple[float, int]]:
     return times
 
 
-def run_ramp(switches: list, total_seconds: float) -> None:
-    """Run the brightness ramp on specified switches."""
-    if not switches:
-        log("No switches to control!")
-        return
+MAX_CONSECUTIVE_FAILURES = 5
 
-    switch_names = ", ".join(s.name for s in switches)
-    log(f"Starting brightness ramp on: {switch_names}")
+
+async def _send_command(client: MatterClient, node_id: int, command) -> None:
+    """Send a device command to endpoint 1 of a node."""
+    await client.send_device_command(node_id, endpoint_id=1, command=command)
+
+
+async def run_ramp(
+    client: MatterClient,
+    node_ids: list[int],
+    total_seconds: float,
+    matter_url: "str | None" = None,
+    ws_session_ref: "list | None" = None,
+    listen_task_ref: "list | None" = None,
+) -> MatterClient:
+    """Run the brightness ramp on specified Matter nodes.
+
+    If *matter_url* is provided, the ramp will attempt to reconnect once on
+    connection failure.  Pass mutable single-element lists for *ws_session_ref*
+    and *listen_task_ref* so the caller can clean up the potentially-new
+    session/task after reconnection.
+
+    Returns the (possibly new) client.
+    """
+    if not node_ids:
+        log("No nodes to control!")
+        return client
+
+    log(f"Starting brightness ramp on node(s): {', '.join(str(n) for n in node_ids)}")
     log(f"Duration: {total_seconds / 60:.1f} minutes")
 
-    for switch in switches:
-        power = getattr(switch, "power", "OFF")
-        if power != "ON":
-            log(f"Turning on {switch.name}")
-            switch.update_attributes({"power": "ON"})
+    # Turn on and set initial brightness
+    for node_id in node_ids:
+        try:
+            await _send_command(client, node_id, clusters.OnOff.Commands.On())
+        except Exception as e:
+            log(f"Error turning on node {node_id}: {e}")
 
     brightness_schedule = calculate_brightness_times(total_seconds)
 
     log("Initial brightness: 1%")
-    for switch in switches:
-        switch.update_attributes({"brightness": 1})
+    for node_id in node_ids:
+        try:
+            await _send_command(
+                client, node_id,
+                clusters.LevelControl.Commands.MoveToLevelWithOnOff(
+                    level=pct_to_matter_level(1),
+                    transitionTime=0, optionsMask=0, optionsOverride=0,
+                ),
+            )
+        except Exception as e:
+            log(f"Error setting brightness on node {node_id}: {e}")
 
     start_time = time.time()
+    consecutive_failures = 0
 
     for target_time, brightness in brightness_schedule[1:]:
         now = time.time()
@@ -279,17 +340,53 @@ def run_ramp(switches: list, total_seconds: float) -> None:
         sleep_duration = target_time - elapsed
 
         if sleep_duration > 0:
-            time.sleep(sleep_duration)
+            await asyncio.sleep(sleep_duration)
 
         elapsed = time.time() - start_time
         log(f"Setting brightness to {brightness}% ({elapsed / 60:.1f} min elapsed)")
-        for switch in switches:
+
+        step_failed = False
+        for node_id in node_ids:
             try:
-                switch.update_attributes({"brightness": brightness})
+                await _send_command(
+                    client, node_id,
+                    clusters.LevelControl.Commands.MoveToLevelWithOnOff(
+                        level=pct_to_matter_level(brightness),
+                        transitionTime=0, optionsMask=0, optionsOverride=0,
+                    ),
+                )
             except Exception as e:
-                log(f"Error updating {switch.name}: {e}")
+                log(f"Error updating node {node_id}: {e}")
+                step_failed = True
+
+        if step_failed:
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                # Try reconnecting once if we have a URL
+                if matter_url and ws_session_ref is not None and listen_task_ref is not None:
+                    log("Too many failures, attempting reconnection...")
+                    try:
+                        await matter_disconnect(client, ws_session_ref[0], listen_task_ref[0])
+                    except Exception:
+                        pass
+                    try:
+                        client, new_ws, new_task = await matter_connect(matter_url)
+                        ws_session_ref[0] = new_ws
+                        listen_task_ref[0] = new_task
+                        consecutive_failures = 0
+                        log("Reconnected successfully, resuming ramp")
+                        continue
+                    except Exception as re:
+                        log(f"Reconnection failed: {re}, aborting ramp")
+                        raise
+                else:
+                    log(f"Aborting ramp after {MAX_CONSECUTIVE_FAILURES} consecutive failures")
+                    raise ConnectionError("Too many consecutive command failures")
+        else:
+            consecutive_failures = 0
 
     log("Brightness ramp complete!")
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -297,22 +394,36 @@ def run_ramp(switches: list, total_seconds: float) -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_config() -> tuple[str, str, list[str]]:
-    """Load configuration from environment variables."""
-    load_dotenv()
+def _get_matter_url() -> str:
+    """Return the configured matter-server URL (call after load_dotenv)."""
+    return os.environ.get("MATTER_SERVER_URL", DEFAULT_MATTER_URL)
 
-    email = os.environ.get("LEVITON_EMAIL")
-    password = os.environ.get("LEVITON_PASSWORD")
-    switch_names_str = os.environ.get("SWITCH_NAMES", "")
 
-    if not email or not password:
-        print("Error: LEVITON_EMAIL and LEVITON_PASSWORD must be set", file=sys.stderr)
-        print("Set them in .env file or environment variables", file=sys.stderr)
+def load_config() -> tuple[str, list[int]]:
+    """Load configuration from environment variables.
+
+    Returns (matter_url, node_ids).
+    """
+    matter_url = _get_matter_url()
+    node_ids_str = os.environ.get("NODE_IDS", "")
+
+    node_ids = []
+    for part in node_ids_str.split(","):
+        part = part.strip()
+        if part:
+            try:
+                node_ids.append(int(part))
+            except ValueError:
+                print(f"Error: Invalid node ID: {part!r}. Must be an integer.", file=sys.stderr)
+                sys.exit(1)
+
+    if not node_ids:
+        print("Error: NODE_IDS must be set (comma-separated list of Matter node IDs)", file=sys.stderr)
+        print("Set it in .env file or environment variables", file=sys.stderr)
+        print("Use 'python main.py list' to see commissioned nodes", file=sys.stderr)
         sys.exit(1)
 
-    switch_names = [name.strip() for name in switch_names_str.split(",") if name.strip()]
-
-    return email, password, switch_names
+    return matter_url, node_ids
 
 
 # ---------------------------------------------------------------------------
@@ -337,29 +448,32 @@ def _seconds_until_midnight() -> float:
     return (midnight - now).total_seconds()
 
 
-def _authenticate_and_get_switches(test: bool) -> tuple:
-    """Authenticate and return (session, filtered_switches). Exits on failure."""
-    email, password, switch_names = load_config()
-    session, all_switches = get_session_and_switches(email, password)
-    switches = filter_switches(all_switches, switch_names)
+async def _connect_and_validate(
+    matter_url: str, node_ids: list[int],
+) -> tuple[MatterClient, aiohttp.ClientSession, asyncio.Task]:
+    """Connect to matter-server and validate that configured node IDs exist."""
+    client, ws_session, listen_task = await matter_connect(matter_url)
 
-    if switch_names and len(switches) != len(switch_names):
-        found_names = {s.name for s in switches}
-        missing = set(switch_names) - found_names
-        log(f"Warning: Could not find switches: {', '.join(missing)}")
+    nodes = client.get_nodes()
+    available_ids = {node.node_id for node in nodes}
 
-    if not switches:
-        log("No switches matched the configured SWITCH_NAMES")
-        for s in all_switches:
-            log(f"  - {s.name}")
-        sys.exit(1)
+    missing = set(node_ids) - available_ids
+    if missing:
+        log(f"Warning: Node ID(s) not found on matter-server: {', '.join(str(n) for n in sorted(missing))}")
+        log(f"Available nodes: {', '.join(str(n) for n in sorted(available_ids))}")
+        await matter_disconnect(client, ws_session, listen_task)
+        raise RuntimeError(f"Missing node(s): {missing}")
 
-    return session, switches
+    return client, ws_session, listen_task
 
 
-def cmd_service(args) -> None:
+async def cmd_service(args) -> None:
     """Run as a persistent service (systemd calls this)."""
-    signal.signal(signal.SIGUSR1, _sigusr1_handler)
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGUSR1, lambda: (
+        _wake_event.set(),
+        log("Received SIGUSR1, waking up to re-evaluate schedule"),
+    ))
 
     test_mode = args.test
     if test_mode:
@@ -375,7 +489,7 @@ def cmd_service(args) -> None:
         if already_ran_today():
             log(f"Already ran today ({today_str}), sleeping until midnight")
             secs = _seconds_until_midnight()
-            interruptible_sleep(secs)
+            await interruptible_sleep(secs)
             continue
 
         # Check for skip override
@@ -384,7 +498,7 @@ def cmd_service(args) -> None:
             log(f"Skip override active for {today_str}")
             record_run()  # Mark as handled so we don't re-check
             secs = _seconds_until_midnight()
-            interruptible_sleep(secs)
+            await interruptible_sleep(secs)
             continue
 
         # Determine target time
@@ -399,7 +513,7 @@ def cmd_service(args) -> None:
         wait_secs = _seconds_until(target_time)
         if wait_secs > 0:
             log(f"Sleeping {wait_secs / 60:.0f} minutes until {target_time}")
-            interrupted = interruptible_sleep(wait_secs)
+            interrupted = await interruptible_sleep(wait_secs)
             if interrupted:
                 log("Sleep interrupted, re-evaluating schedule")
                 continue  # Re-check overrides from the top
@@ -411,26 +525,42 @@ def cmd_service(args) -> None:
             log(f"Skip override added while sleeping for {today_str}")
             record_run()
             secs = _seconds_until_midnight()
-            interruptible_sleep(secs)
+            await interruptible_sleep(secs)
             continue
 
         if already_ran_today():
             secs = _seconds_until_midnight()
-            interruptible_sleep(secs)
+            await interruptible_sleep(secs)
             continue
 
         # Run the ramp
         total_seconds = 2 * 60 if test_mode else 30 * 60
+        matter_url, node_ids = load_config()
+        client = None
+        ws_session = None
+        listen_task = None
         try:
-            session, switches = _authenticate_and_get_switches(test_mode)
-            run_ramp(switches, total_seconds)
+            client, ws_session, listen_task = await _connect_and_validate(matter_url, node_ids)
+            ws_ref = [ws_session]
+            task_ref = [listen_task]
+            client = await run_ramp(
+                client, node_ids, total_seconds,
+                matter_url=matter_url,
+                ws_session_ref=ws_ref,
+                listen_task_ref=task_ref,
+            )
+            ws_session = ws_ref[0]
+            listen_task = task_ref[0]
             record_run()
         except Exception as e:
             log(f"Ramp failed: {e}")
             # Don't record_run on failure — will retry next loop iteration
             # Sleep a bit before retrying to avoid tight error loops
-            interruptible_sleep(60)
+            await interruptible_sleep(60)
             continue
+        finally:
+            if client and ws_session and listen_task:
+                await matter_disconnect(client, ws_session, listen_task)
 
         # Clean up expired overrides
         overrides = load_overrides()
@@ -441,18 +571,34 @@ def cmd_service(args) -> None:
         # Sleep until midnight
         secs = _seconds_until_midnight()
         log(f"Ramp complete, sleeping {secs / 60:.0f} minutes until midnight")
-        interruptible_sleep(secs)
+        await interruptible_sleep(secs)
 
 
-def cmd_run(args) -> None:
+async def cmd_run(args) -> None:
     """Run a single ramp immediately (manual trigger)."""
     total_seconds = 2 * 60 if args.test else 30 * 60
+    matter_url, node_ids = load_config()
+    client = None
+    ws_session = None
+    listen_task = None
     try:
-        session, switches = _authenticate_and_get_switches(args.test)
-        run_ramp(switches, total_seconds)
+        client, ws_session, listen_task = await _connect_and_validate(matter_url, node_ids)
+        ws_ref = [ws_session]
+        task_ref = [listen_task]
+        client = await run_ramp(
+            client, node_ids, total_seconds,
+            matter_url=matter_url,
+            ws_session_ref=ws_ref,
+            listen_task_ref=task_ref,
+        )
+        ws_session = ws_ref[0]
+        listen_task = task_ref[0]
     except Exception as e:
         log(f"Error: {e}")
         sys.exit(1)
+    finally:
+        if client and ws_session and listen_task:
+            await matter_disconnect(client, ws_session, listen_task)
 
 
 def cmd_skip(args) -> None:
@@ -485,7 +631,7 @@ def cmd_reschedule(args) -> None:
     notify_service()
 
 
-def cmd_status(args) -> None:
+async def cmd_status(args) -> None:
     """Show active overrides and next scheduled ramp."""
     overrides = load_overrides()
     state = load_state()
@@ -545,6 +691,17 @@ def cmd_status(args) -> None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         print("Service: unknown (systemctl not available)")
 
+    # Matter server connection check
+    matter_url = _get_matter_url()
+    print()
+    try:
+        client, ws_session, listen_task = await matter_connect(matter_url)
+        nodes = client.get_nodes()
+        print(f"Matter server: connected ({len(nodes)} node(s))")
+        await matter_disconnect(client, ws_session, listen_task)
+    except Exception as e:
+        print(f"Matter server: not reachable ({e})")
+
 
 def cmd_clear(args) -> None:
     """Remove override(s)."""
@@ -565,15 +722,120 @@ def cmd_clear(args) -> None:
     notify_service()
 
 
-def cmd_list(args) -> None:
-    """List all switches."""
-    email, password, switch_names = load_config()
+async def cmd_list(args) -> None:
+    """List all commissioned Matter nodes."""
+    matter_url = _get_matter_url()
+    client = None
+    ws_session = None
+    listen_task = None
     try:
-        session, all_switches = get_session_and_switches(email, password)
-        list_switches(all_switches)
+        client, ws_session, listen_task = await matter_connect(matter_url)
+        nodes = client.get_nodes()
+
+        if not nodes:
+            print("No commissioned nodes found.")
+        else:
+            print(f"Commissioned nodes ({len(nodes)}):")
+            print()
+            for node in nodes:
+                node_id = node.node_id
+                # Try to get device name from Basic Information cluster
+                name = "Unknown"
+                try:
+                    basic_info = node.get_attribute_value(
+                        clusters.BasicInformation.Attributes.NodeLabel
+                    )
+                    if basic_info:
+                        name = basic_info
+                except Exception:
+                    pass
+
+                # Try to get on/off state
+                on_off = "unknown"
+                try:
+                    on_off_val = node.get_attribute_value(
+                        clusters.OnOff.Attributes.OnOff
+                    )
+                    on_off = "ON" if on_off_val else "OFF"
+                except Exception:
+                    pass
+
+                # Try to get brightness level
+                brightness = "N/A"
+                try:
+                    level = node.get_attribute_value(
+                        clusters.LevelControl.Attributes.CurrentLevel
+                    )
+                    if level is not None:
+                        brightness = f"{matter_level_to_pct(level)}%"
+                except Exception:
+                    pass
+
+                print(f"  Node {node_id}: {name}")
+                print(f"    Power: {on_off}")
+                print(f"    Brightness: {brightness}")
+                print()
     except Exception as e:
         log(f"Error: {e}")
         sys.exit(1)
+    finally:
+        if client and ws_session and listen_task:
+            await matter_disconnect(client, ws_session, listen_task)
+
+
+async def cmd_commission(args) -> None:
+    """Commission a new Matter device."""
+    matter_url = _get_matter_url()
+    client = None
+    ws_session = None
+    listen_task = None
+    try:
+        client, ws_session, listen_task = await matter_connect(matter_url)
+        log(f"Commissioning device with code: {args.code}")
+        result = await client.commission_with_code(args.code)
+        log(f"Commissioned successfully! Node ID: {result}")
+    except Exception as e:
+        log(f"Commission failed: {e}")
+        sys.exit(1)
+    finally:
+        if client and ws_session and listen_task:
+            await matter_disconnect(client, ws_session, listen_task)
+
+
+async def cmd_set_wifi(args) -> None:
+    """Store WiFi credentials on the matter-server for commissioning."""
+    matter_url = _get_matter_url()
+    client = None
+    ws_session = None
+    listen_task = None
+    try:
+        client, ws_session, listen_task = await matter_connect(matter_url)
+        await client.set_wifi_credentials(ssid=args.ssid, credentials=args.password)
+        log(f"WiFi credentials set for SSID: {args.ssid}")
+    except Exception as e:
+        log(f"Failed to set WiFi credentials: {e}")
+        sys.exit(1)
+    finally:
+        if client and ws_session and listen_task:
+            await matter_disconnect(client, ws_session, listen_task)
+
+
+async def cmd_remove_node(args) -> None:
+    """Remove a commissioned node from the matter-server."""
+    matter_url = _get_matter_url()
+    client = None
+    ws_session = None
+    listen_task = None
+    try:
+        client, ws_session, listen_task = await matter_connect(matter_url)
+        await client.remove_node(args.node_id)
+        log(f"Removed node {args.node_id}")
+    except Exception as e:
+        log(f"Failed to remove node: {e}")
+        sys.exit(1)
+    finally:
+        if client and ws_session and listen_task:
+            await matter_disconnect(client, ws_session, listen_task)
 
 
 # ---------------------------------------------------------------------------
@@ -583,17 +845,8 @@ def cmd_list(args) -> None:
 
 def main() -> None:
     """Main entry point with subcommand dispatch."""
-
-    # Backward-compatibility shim: if called with old-style --list or --test
-    # (no subcommand), translate to the new subcommands.
-    if len(sys.argv) > 1 and sys.argv[1].startswith("--"):
-        if "--list" in sys.argv:
-            sys.argv = [sys.argv[0], "list"]
-        elif "--test" in sys.argv:
-            sys.argv = [sys.argv[0], "run", "--test"]
-
     parser = argparse.ArgumentParser(
-        description="Circadian brightness ramp for Leviton Decora WiFi switches"
+        description="Circadian brightness ramp for Matter-enabled dimmers"
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -634,7 +887,7 @@ def main() -> None:
     )
 
     # status
-    subparsers.add_parser("status", help="Show active overrides and next scheduled ramp")
+    subparsers.add_parser("status", help="Show status, overrides, and Matter server info")
 
     # clear
     sp_clear = subparsers.add_parser("clear", help="Remove override(s)")
@@ -644,7 +897,20 @@ def main() -> None:
     )
 
     # list
-    subparsers.add_parser("list", help="List all switches")
+    subparsers.add_parser("list", help="List all commissioned Matter nodes")
+
+    # commission
+    sp_commission = subparsers.add_parser("commission", help="Commission a new Matter device")
+    sp_commission.add_argument("code", help="Matter pairing code")
+
+    # set-wifi
+    sp_wifi = subparsers.add_parser("set-wifi", help="Store WiFi credentials for commissioning")
+    sp_wifi.add_argument("ssid", help="WiFi network name")
+    sp_wifi.add_argument("password", help="WiFi password")
+
+    # remove-node
+    sp_remove = subparsers.add_parser("remove-node", help="Remove a commissioned node")
+    sp_remove.add_argument("node_id", type=int, help="Node ID to remove")
 
     args = parser.parse_args()
 
@@ -652,17 +918,33 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    dispatch = {
-        "service": cmd_service,
-        "run": cmd_run,
+    # Load .env and set env-dependent globals for all commands
+    load_dotenv()
+    _init_env_config()
+
+    # Sync commands (no Matter connection needed)
+    sync_dispatch = {
         "skip": cmd_skip,
         "reschedule": cmd_reschedule,
-        "status": cmd_status,
         "clear": cmd_clear,
-        "list": cmd_list,
     }
 
-    dispatch[args.command](args)
+    if args.command in sync_dispatch:
+        sync_dispatch[args.command](args)
+        return
+
+    # Async commands
+    async_dispatch = {
+        "service": cmd_service,
+        "run": cmd_run,
+        "status": cmd_status,
+        "list": cmd_list,
+        "commission": cmd_commission,
+        "set-wifi": cmd_set_wifi,
+        "remove-node": cmd_remove_node,
+    }
+
+    asyncio.run(async_dispatch[args.command](args))
 
 
 if __name__ == "__main__":
